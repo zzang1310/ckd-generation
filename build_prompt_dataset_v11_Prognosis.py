@@ -170,9 +170,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-lang",
         type=str,
-        default="ko",
+        default="en",
         choices=["ko", "en"],
-        help="출력 언어: ko(한국어) 또는 en(English). instruction/output의 고정 문구에 적용"
+        help="출력 언어: en(English, 기본) 또는 ko(한국어). instruction/input/output 고정 문구에 적용. Me-LLaMA는 한글 사전학습 없음 → 영문 권장"
     )
     # AKI 라벨 소스 옵션
     parser.add_argument(
@@ -245,7 +245,7 @@ def parse_args() -> argparse.Namespace:
 
     # Prognosis 품질 게이팅(앵커(cutoff_time) 기준 과거 윈도우 품질 보장)
     # - 기본 적용: pred_days>0(미래예측) 샘플에만 적용
-    # - 필요 시 --quality-gate-include-current 로 pred_days=0에도 적용
+    # - v11부터 기본값 변경: 0일(pred_days=0)에도 품질 게이팅을 기본 적용
     parser.add_argument(
         "--min-scr-count",
         type=int,
@@ -267,7 +267,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quality-gate-include-current",
         action="store_true",
-        help="품질 게이팅을 pred_days=0(현재시점) 샘플에도 적용",
+        default=True,
+        help="(기본값: 적용) 품질 게이팅을 pred_days=0(현재시점) 샘플에도 적용",
+    )
+    parser.add_argument(
+        "--no-quality-gate-include-current",
+        action="store_false",
+        dest="quality_gate_include_current",
+        help="품질 게이팅을 pred_days=0(현재시점)에는 적용하지 않음(구버전 동작)",
     )
 
     # eGFR history(eGFR 과거 추세) 입력 포함 옵션
@@ -649,7 +656,7 @@ def get_texts(lang: str) -> Dict[str, str]:
         ),
         "instr_egfr_json": (
             "현재 시점까지의 환자 임상 데이터를 바탕으로, 현재 eGFR을 예측하세요. "
-            "JSON만 출력: {{\"eGFR\": 숫자}}"
+            "JSON만 출력: {{\"eGFR\": <number>}}"
         ),
         "instr_egfr_prognosis": (
             "현재 시점까지의 환자 임상 데이터를 바탕으로, {horizon_days}일 후의 eGFR을 예측하세요. "
@@ -657,7 +664,7 @@ def get_texts(lang: str) -> Dict[str, str]:
         ),
         "instr_egfr_prognosis_json": (
             "현재 시점까지의 환자 임상 데이터를 바탕으로, {horizon_days}일 후의 eGFR을 예측하세요. "
-            "JSON만 출력: {{\"eGFR\": 숫자}}"
+            "JSON만 출력: {{\"eGFR\": <number>}}"
         ),
         "instr_aki": (
             "현재 시점의 환자 임상 데이터를 바탕으로 AKI(0/1) 발생 여부를 판단하세요. "
@@ -1492,6 +1499,22 @@ def get_patient_background(
             anchor_age_val = pt_row.iloc[0].get("anchor_age")
             anchor_year_val = pt_row.iloc[0].get("anchor_year")
 
+    # 앵커 시점(target_time) 직전 최신 Cr → eGFR trajectory에 현재 시점 반영
+    _anchor_cr = None
+    if isinstance(lab_data, pd.DataFrame) and not lab_data.empty and target_time is not None:
+        _CR_IDS = {50912, 52546}
+        _pt_cr = lab_data[
+            (lab_data["subject_id"] == patient_id) & (lab_data["itemid"].isin(_CR_IDS))
+        ] if "subject_id" in lab_data.columns else lab_data[lab_data["itemid"].isin(_CR_IDS)]
+        if not _pt_cr.empty:
+            _pt_cr = _pt_cr[_pt_cr["valuenum"].notna() & (_pt_cr["valuenum"] > 0) & (_pt_cr["valuenum"] < 30)].copy()
+            if not _pt_cr.empty:
+                if not pd.api.types.is_datetime64_any_dtype(_pt_cr["charttime"]):
+                    _pt_cr["charttime"] = pd.to_datetime(_pt_cr["charttime"], errors="coerce")
+                _recent = _pt_cr[_pt_cr["charttime"] <= target_time].sort_values("charttime")
+                if not _recent.empty:
+                    _anchor_cr = float(_recent.iloc[-1]["valuenum"])
+
     if isinstance(lab_data, pd.DataFrame) and not lab_data.empty and not admissions_df.empty:
         egfr_traj = extract_egfr_trajectory(
             patient_id=patient_id,
@@ -1502,6 +1525,7 @@ def get_patient_background(
             anchor_age=anchor_age_val,
             anchor_year=anchor_year_val,
             target_time=target_time,
+            anchor_cr=_anchor_cr,
         )
     else:
         egfr_traj = {}
@@ -3658,7 +3682,9 @@ def main() -> None:
     # 확장자 분리하여 정보 삽입
     stem = original_path.stem  # 파일명 (확장자 제외)
     suffix = original_path.suffix  # 확장자
-    timestamped_name = f"{stem}_{patient_str}_{label_str}_{timestamp}{suffix}"
+    # qg_currEGFR_add: 0일 quality gate + kidney history에 current eGFR 추가 버전임을 명시
+    # 예) CKD_llm_prompts_0230_...._P1000_LEGFR_260230_1200_qg_currEGFR_add.json
+    timestamped_name = f"{stem}_{patient_str}_{label_str}_{timestamp}_qg_currEGFR_add{suffix}"
     output_path = original_path.parent / timestamped_name
     
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3685,7 +3711,10 @@ def main() -> None:
         if args.file_format == "json-pretty":  # 기본값인 경우만
             print(f"[OUTPUT] 파일 확장자(.json)에 따라 JSON Array 형식으로 저장")
     
-    # 파일 저장
+    # 파일 저장 (환자 ID 정렬로 데이터 순서 고정 → 학습 시 train/val split 재현성 확보)
+    def _pid(r):
+        return r.get("metadata", {}).get("patient_id") or 0
+    generated = sorted(generated, key=_pid)
     if file_format == "json-pretty":
         # 가독성 좋은 JSON Array 형식
         with open(output_path, 'w', encoding='utf-8') as f:
