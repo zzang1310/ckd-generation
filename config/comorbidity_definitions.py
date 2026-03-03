@@ -1161,6 +1161,7 @@ def extract_egfr_trajectory(
     anchor_age: Optional[int] = None,
     anchor_year: Optional[int] = None,
     target_time: Optional[pd.Timestamp] = None,
+    anchor_cr: Optional[float] = None,
 ) -> Dict[str, Any]:
     """입원별 첫 Cr → CKD-EPI 2021 eGFR 궤적을 추출.
 
@@ -1172,6 +1173,7 @@ def extract_egfr_trajectory(
         gender: 'M' or 'F'
         anchor_age, anchor_year: MIMIC de-identification anchors
         target_time: 프롬프트 기준시점 (이 시점까지만)
+        anchor_cr: 앵커 시점의 Cr 값 (있으면 현재 입원 내 현재 eGFR 포인트 추가)
 
     Returns:
         {
@@ -1260,6 +1262,25 @@ def extract_egfr_trajectory(
     if not points:
         return result
 
+    # --- 앵커 시점 eGFR 추가 (현재 입원 내 현재 시점) ---
+    if anchor_cr is not None and anchor_cr > 0 and anchor_cr < 30 and target_time is not None:
+        if anchor_age is not None and anchor_year is not None:
+            anchor_pt_age = int(anchor_age) + (target_time.year - int(anchor_year))
+        elif age is not None:
+            anchor_pt_age = int(age)
+        else:
+            anchor_pt_age = None
+        if anchor_pt_age is not None:
+            anchor_egfr = compute_egfr_ckd_epi_2021(anchor_cr, anchor_pt_age, is_female)
+            if anchor_egfr is not None:
+                anchor_egfr_r = int(round(anchor_egfr))
+                points.append({
+                    "date": target_time,
+                    "egfr": anchor_egfr_r,
+                    "stage": _egfr_to_ckd_stage(anchor_egfr_r),
+                    "is_anchor": True,
+                })
+
     # --- trend 계산 ---
     egfr_vals = [p["egfr"] for p in points]
     first_egfr = egfr_vals[0]
@@ -1288,13 +1309,15 @@ def extract_egfr_trajectory(
     span_days = (points[-1]["date"] - points[0]["date"]).days
     span_months = max(int(round(span_days / 30.44)), 0)
 
+    n_adm_only = sum(1 for p in points if not p.get("is_anchor"))
     result = {
         "points": points,
         "current_egfr": last_egfr,
         "current_stage": _egfr_to_ckd_stage(last_egfr),
         "baseline_egfr": first_egfr,
         "baseline_stage": _egfr_to_ckd_stage(first_egfr),
-        "n_admissions": len(points),
+        "n_admissions": n_adm_only,
+        "has_anchor_point": any(p.get("is_anchor") for p in points),
         "span_months": span_months,
         "trend": trend,
     }
@@ -1305,8 +1328,9 @@ def format_egfr_trajectory(traj: Dict[str, Any]) -> str:
     """extract_egfr_trajectory 결과 → 프롬프트 텍스트.
 
     Examples:
-        Kidney history (7 adm/12yr): eGFR 106->90->63->34 (declining), Stage 3b
-        Kidney history: eGFR 58 (stable), Stage 3a
+        Kidney history (7 adm/1yr3mo): eGFR 90->49->53->39->42 (declining), Stage 3b
+        Kidney history: eGFR 19->69 (improving), Stage 2
+        Kidney history: eGFR 58, Stage 3a
     """
     if not traj or "points" not in traj:
         return ""
@@ -1322,7 +1346,7 @@ def format_egfr_trajectory(traj: Dict[str, Any]) -> str:
 
     egfr_vals = [p["egfr"] for p in points]
 
-    # 궤적 포인트 압축: > _MAX_TRAJECTORY_POINTS이면 키포인트만
+    # 궤적 포인트 압축: > _MAX_TRAJECTORY_POINTS이면 키포인트만 (마지막=앵커 포인트 보존)
     if len(egfr_vals) > _MAX_TRAJECTORY_POINTS:
         n = len(egfr_vals)
         indices = [0]
@@ -1348,7 +1372,7 @@ def format_egfr_trajectory(traj: Dict[str, Any]) -> str:
     else:
         span_str = ""
 
-    # 조립
+    # 단일 입원, 앵커 포인트도 없음 → 값 하나만
     if len(points) == 1:
         return f"Kidney history: eGFR {egfr_vals[0]}, Stage {current_stage}"
 
